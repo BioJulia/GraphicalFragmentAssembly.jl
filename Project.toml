@@ -1,0 +1,10 @@
+name = "GraphicalFragmentAssembly"
+uuid = "ec80d939-4f2b-450e-877b-d58b16458eaf"
+authors = ["Jakob Nybo Nissen <jakobnybonissen@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+Automa = "67c07d97-cdcb-5c2c-af73-a7f9c32a568b"
+BioGenerics = "47718e42-2ac5-11e9-14af-e5595289c2ea"
+StringViews = "354b36f9-a18e-4713-926e-db85100087ba"
+TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
