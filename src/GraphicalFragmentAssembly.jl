@@ -68,6 +68,7 @@ include("optional.jl")
 using .Optional
 
 GFA_MACHINE = let
+    tabs(arg, args...) = foldl((i, j) -> i * re"\t" * j, args; init=arg)
     newline = let
         lf = re"\n"
         lf.actions[:enter] = [:count_line]
@@ -79,10 +80,25 @@ GFA_MACHINE = let
     # machine to handle to avoid single machines being insanely complex
     optional_entry = re"\t"
     optional_entry.actions[:enter] = [:enter_optional]
+    name = re"[!-)+-<>-~][!-~]*"
+    plusminus = re"\+|-"
+    cigar = re"\*" | re"([0-9]+[MIDNSHPX=])+"
+    int = re"[0-9]+"
 
-    header = re"H" * RE.opt(optional_entry)
+    header = re"H"
+    segment = tabs(re"S", name, (re"\*" | re"[A-Za-z=.]+"))
+    link = tabs(re"L", name, plusminus, name, plusminus, cigar)
+    # Specs's int regex in containment claims it can be empty - this might be a typo.
+    # We require at least one digit here.
+    containment = tabs(re"C", name, plusminus, name, plusminus, int, cigar)
+    path_overlaps = re"\*" | RE.rep1(cigar | re"[-+]?[0-9]+J" | re"\.")
+    path = tabs(re"P", name, name, path_overlaps)
+    optint = re"\*" | int
+    walk = tabs(re"W", name, int, name, optint, optint, re"([><][!-;=?-~]+)+")
+    jump = tabs(re"J", name, plusminus, name, plusminus, re"\*|([-+]?[0-9]+)")
 
-    line = header
+
+    line = (header | segment | link | containment | path | walk | jump) * RE.opt(optional_entry)
     line.actions[:enter] = [:enter_line]
     line.actions[:exit] = [:exit_line]
     line_or_comment = line | comment
@@ -100,10 +116,17 @@ const GFA_ACTIONS = Dict(
     # At the end of a line, we append the entire line to the lazy record,
     # including all tabs and so on, but not including final \r?\n
     :exit_line => quote
-        append_from!(record.buffer, 1, data, @markpos, p - @markpos)
+        data_length = p - @markpos
+        append_from!(record.buffer, 1, data, @markpos, data_length)
         # Set bufferpos back one byte so next record begins at the same byte
         # where the machine left off
         buffer.bufferpos -= 1
+        # The optional field is set if optional data is encountered.
+        # If not, we still need to set the field in order to signal
+        # where the non-optional data ends
+        if isempty(record.optional)
+            record.optional = data_length + 1 : data_length
+        end
         found = true
         @escape
     end,
@@ -159,6 +182,7 @@ mutable struct Reader{S <: TranscodingStream} <: BioGenerics.IO.AbstractReader
     end
 end
 
+Base.eltype(::Type{<:Reader}) = LazyRecord
 Reader(io::TranscodingStream; copy::Bool=true) = Reader{typeof(io)}(io, copy)
 Reader(io::IO; kwargs...) = Reader(NoopStream(io); kwargs...)
 
@@ -178,7 +202,7 @@ function Base.read!(reader::Reader, record::LazyRecord)
     y === nothing ? throw(EOFError()) : record
 end
 
-function Base.iterate(reader::Reader, _::Nothing=nothing)
+function Base.iterate(reader::Reader, _::Nothing=nothing)::Union{Nothing, Tuple{LazyRecord, Nothing}}
     y = tryread!(reader, reader.record)
     return if y === nothing
         nothing
@@ -196,7 +220,7 @@ function materialize_header(record::LazyRecord)
     tag = convert(Tag, "VN")
     version = nothing
     for (k, v) in optionals(record)
-        k == tag && materialize(v)::String
+        k == tag && (version = materialize(v)::String)
     end
     Header(version)
 end
