@@ -15,6 +15,9 @@ const AUTOMA_CONTEXT = Automa.CodeGenContext(;
 struct Unsafe end
 const unsafe = Unsafe()
 
+function optionals end
+function materialize end
+
 """
     LazyRecord
 
@@ -60,15 +63,6 @@ function append_from!(dst, dpos, src, spos, n)
     return dst
 end
 
-function materialize(record::LazyRecord)
-    # TODO: All records must have its own materilize function
-    if record.type == UInt8('H')
-        return materialize_header(record)
-    else
-        error("Invalid record type")
-    end
-end
-
 include("optional.jl")
 using .Optional
 
@@ -91,19 +85,19 @@ GFA_MACHINE = let
     int = re"[0-9]+"
 
     header = re"H"
-    segment = tabs(re"S", name, (re"\*" | re"[A-Za-z=.]+"))
-    link = tabs(re"L", name, plusminus, name, plusminus, cigar)
+    S_regex = tabs(re"S", name, (re"\*" | re"[A-Za-z=.]+"))
+    L_regex = tabs(re"L", name, plusminus, name, plusminus, cigar)
     # Specs's int regex in containment claims it can be empty - this might be a typo.
     # We require at least one digit here.
-    containment = tabs(re"C", name, plusminus, name, plusminus, int, cigar)
+    C_regex = tabs(re"C", name, plusminus, name, plusminus, int, cigar)
     path_overlaps = re"\*" | RE.rep1(cigar | re"[-+]?[0-9]+J" | re"\.")
-    path = tabs(re"P", name, name, path_overlaps)
+    P_regex = tabs(re"P", name, name, path_overlaps)
     optint = re"\*" | int
-    walk = tabs(re"W", name, int, name, optint, optint, re"([><][!-;=?-~]+)+")
-    jump = tabs(re"J", name, plusminus, name, plusminus, re"\*|([-+]?[0-9]+)")
+    W_regex = tabs(re"W", name, int, name, optint, optint, re"([><][!-;=?-~]+)+")
+    J_regex = tabs(re"J", name, plusminus, name, plusminus, re"\*|([-+]?[0-9]+)")
 
 
-    line = (header | segment | link | containment | path | walk | jump) * RE.opt(optional_entry)
+    line = (header | S_regex | L_regex | C_regex | P_regex | W_regex | J_regex) * RE.opt(optional_entry)
     line.actions[:enter] = [:enter_line]
     line.actions[:exit] = [:exit_line]
     line_or_comment = line | comment
@@ -117,6 +111,7 @@ const GFA_ACTIONS = Dict(
     :enter_line => quote
         @mark
         record.type = byte
+        found_optional = false
     end,
     # At the end of a line, we append the entire line to the lazy record,
     # including all tabs and so on, but not including final \r?\n
@@ -131,7 +126,7 @@ const GFA_ACTIONS = Dict(
         # The optional field is set if optional data is encountered.
         # If not, we still need to set the field in order to signal
         # where the non-optional data ends
-        if isempty(record.optional)
+        if !found_optional
             record.optional = data_length + 2 : data_length - 1
         end
         found = true
@@ -163,6 +158,7 @@ const GFA_ACTIONS = Dict(
         # data. If that's the case, then the mem variable points to now-invalid data.
         # So redefine it.
         mem = Automa.SizedMemory(data)
+        found_optional = true
     end
 )
 
@@ -179,6 +175,7 @@ Automa.Stream.generate_reader(
         # Init byte here so it's visible in the entire function scope
         byte = 0x00
         found = false
+        found_optional = false
         cs = state
     end,
     loopcode = quote
@@ -190,10 +187,8 @@ Automa.Stream.generate_reader(
     returncode = :(return cs, linenum, found)
 ) |> eval
 
-# TODO: Parameterize the reader by :lazy or :eager to allow eagerly materializing
-# the LazyRecord for when performance does not matter.
-# Also perhaps make it handle GFA versions 1 and 2?
-mutable struct Reader{S <: TranscodingStream} <: BioGenerics.IO.AbstractReader
+# TODO: perhaps make it handle GFA versions 1 and 2?
+mutable struct Reader{M, S <: TranscodingStream} <: BioGenerics.IO.AbstractReader
     const stream::S
     const record::LazyRecord
     # We store all tags of the optional fields in this buffer,
@@ -207,17 +202,24 @@ mutable struct Reader{S <: TranscodingStream} <: BioGenerics.IO.AbstractReader
     # Whether to automatically copy out the record or read in-place
     const copy::Bool
 
-    function Reader{T}(io::T, copy::Bool) where {T <: TranscodingStream}
+    function Reader{M, T}(io::T, copy::Bool) where {M, T <: TranscodingStream}
+        M !== :eager && M !== :lazy && error("Mode must be :eager or :lazy")
         v = Vector{UInt8}(undef, 2048)
         @inbounds v[1] = UInt8('H')
+        tags = fill(Tag((UInt8('x'), UInt8('x')), unsafe), 64)
         record = LazyRecord(v, 3:2, UInt8('H'))
-        new{T}(io, record, Vector{Tag}(undef, 64), 1, 1, copy)
+        new{M, T}(io, record, tags, 1, 1, copy)
     end
 end
 
-Base.eltype(::Type{<:Reader}) = LazyRecord
-Reader(io::TranscodingStream; copy::Bool=true) = Reader{typeof(io)}(io, copy)
+Base.eltype(::Type{<:Reader{:lazy}}) = LazyRecord
+Base.eltype(::Type{<:Reader{:eager}}) = Materialized
 Reader(io::IO; kwargs...) = Reader(NoopStream(io); kwargs...)
+
+function Reader(io::TranscodingStream; copy::Bool=true, eager::Bool=true)
+    mode = eager ? :eager : :lazy
+    Reader{mode, typeof(io)}(io, copy)
+end
 
 function tryread!(reader::Reader, record::LazyRecord)
     (state, linenum, found) = read_record!(reader.stream, record, reader.tag_buffer, reader.linenum, reader.automa_state)
@@ -237,31 +239,45 @@ function Base.read!(reader::Reader, record::LazyRecord)
     y === nothing ? throw(EOFError()) : record
 end
 
-function Base.iterate(reader::Reader, _::Nothing=nothing)::Union{Nothing, Tuple{LazyRecord, Nothing}}
+function Base.iterate(reader::Reader{Mode}, _::Nothing=nothing) where Mode
     y = tryread!(reader, reader.record)
     return if y === nothing
         nothing
     else
         record = reader.copy ? copy(reader.record) : reader.record
+        record = Mode === :lazy ? record : materialize(record)
         (record, nothing)
     end
 end
 
 struct Header
-    version::Union{String, Nothing}
+    optionals::OptionalFields
 end
 
 function materialize_header(record::LazyRecord)
-    version = get(optionals(record), Tag("VN"), nothing)::Union{String, Nothing}
-    Header(version)
+    buffer = record.buffer[record.optional]
+    Header(OptionalFields(view(buffer, 1:length(buffer))))
 end
+
+const Materialized = Union{Header}
+
+function materialize(record::LazyRecord)::Materialized
+    # TODO: All records must have its own materilize function
+    if record.type == UInt8('H')
+        return materialize_header(record)
+    else
+        error("Invalid record type")
+    end
+end
+
+optionals(x::Materialized) = x.optionals
 
 #=
 using GraphicalFragmentAssembly
 
 data = "#abcdef\r\nH\tVS:i:-199\nH\nH\tAB:A:z"
 reader = GraphicalFragmentAssembly.Reader(IOBuffer(data))
-collect(reader)
+recs = collect(reader)
 
 GraphicalFragmentAssembly.read_record!(io, rec, 1, 1)
 GraphicalFragmentAssembly.read_record!(io, rec, 1, 4)

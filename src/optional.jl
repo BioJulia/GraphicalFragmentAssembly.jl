@@ -3,13 +3,13 @@ module Optional
 # TODO: Add validation of only 1 of same Optional in same line
 
 using GraphicalFragmentAssembly: Unsafe, unsafe, LazyRecord, AUTOMA_CONTEXT, append_from!, unsafe_char
-import GraphicalFragmentAssembly: materialize
+import GraphicalFragmentAssembly: materialize, optionals
 using Automa: Automa, RegExp as RE
 using Automa.RegExp: @re_str
 using Automa.Stream: @mark, @markpos
 using StringViews: StringView
 
-export Tag, OptionalFields, optionals, LazyOptional, JSONString, index_optional!
+export Tag, OptionalFields, LazyOptional, JSONString, index_optional!
 
 const B_ARRAY_TYPES_DICT = Dict(
     'c' => Int8,
@@ -90,7 +90,7 @@ the underlying data left-to-right.
 See also: [`optionals`](@ref)
 """
 struct OptionalFields <: AbstractDict{Tag, LazyOptional}
-    x::LazyRecord
+    x::ViewType
 end
 
 """
@@ -100,7 +100,7 @@ Create an `OptionalFields` lazy iterator of optional fields in the record.
 
 See also: [`OptionalFields`](@ref)
 """
-optionals(x::LazyRecord) = OptionalFields(x)
+optionals(x::LazyRecord) = OptionalFields(view(x.buffer, x.optional))
 
 """
     materialize(::OptionalFields)::Dict
@@ -120,26 +120,27 @@ function materialize(x::OptionalFields)
 end
 
 function Base.length(x::OptionalFields)
-    if isempty(x.x.optional)
+    if isempty(x.x)
         0
     else
-        count(isequal(UInt8('\t')), view(x.x.buffer, x.x.optional)) + 1
+        count(isequal(UInt8('\t')), x.x) + 1
     end
 end
 
 Base.IteratorSize(::Type{OptionalFields}) = Base.SizeUnknown()
 
-function Base.iterate(x::OptionalFields, state=first(x.x.optional))
-    state > last(x.x.optional) && return nothing
-    buffer = x.x.buffer
-    start_pos = state + 5
+function Base.iterate(x::OptionalFields, state=1)
+    buffer = x.x
+    len = length(buffer)
+    state > len && return nothing
+    start_pos = state
     final_pos = let
-        p = findnext(isequal(UInt8('\t')), buffer, state+6)
-        p === nothing ? last(x.x.optional) : (p - 1)
+        p = findnext(isequal(UInt8('\t')), buffer, start_pos+1)
+        p === nothing ? len : (p - 1)
     end
     data = view(buffer, start_pos:final_pos)
-    tag = Tag((buffer[state], buffer[state+1]), unsafe)
-    lazytag = LazyOptional(buffer[state+3], data)
+    tag = Tag((buffer[start_pos], buffer[start_pos+1]), unsafe)
+    lazytag = LazyOptional(buffer[start_pos+3], data)
     (tag => lazytag, final_pos + 2)
 end
 
