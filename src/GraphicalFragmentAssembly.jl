@@ -136,7 +136,7 @@ const GFA_ACTIONS = Dict(
         record_optional_index = p - @markpos() + 2
         # Read the optional data and mark its position in the record,
         # and also update p.
-        p = index_optional!(stream, record, optional_start, linenum, record_optional_index) - 1
+        p = index_optional!(stream, record, tags, optional_start, linenum, record_optional_index) - 1
         buffer.bufferpos = p
         # It is possible that the optional machine has resized the buffer underlying
         # data. If that's the case, then the mem variable points to now-invalid data.
@@ -152,6 +152,7 @@ Automa.Stream.generate_reader(
     actions = GFA_ACTIONS,
     context = AUTOMA_CONTEXT,
     initcode = quote
+        tags = Vector{Tag}(undef, 64)
         linenum = 1
         byte = 0x00
         found = false
@@ -227,11 +228,10 @@ end
 
 #=
 using GraphicalFragmentAssembly
-using TranscodingStreams
 
 data = "#abcdef\r\nH\tVS:i:-199\nH\nH\tAB:A:z"
-rec = GraphicalFragmentAssembly.LazyRecord()
-io = NoopStream(IOBuffer(data); bufsize=3)
+reader = GraphicalFragmentAssembly.Reader(IOBuffer(data))
+collect(reader)
 
 GraphicalFragmentAssembly.read_record!(io, rec, 1, 1)
 GraphicalFragmentAssembly.read_record!(io, rec, 1, 4)

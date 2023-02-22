@@ -154,6 +154,18 @@ function materialize(tag::LazyOptional)::OptTypes
     end
 end
 
+function check_duplicates(v::Vector{Tag}, n::Int, linenum::Int)
+    length(v) ≥ n || throw(BoundsError(v, n))
+    @inbounds for i in 1:n-1
+        a = v[1]
+        for j in i+1:n
+            b = v[j]
+            a == b && error(lazy"Duplicate tag on line $linenum: \"$a\"")
+        end
+    end
+    nothing
+end
+
 const OPTIONAL_MACHINE = let
     signed = re"[-+]?[0-9]+"
     unsigned = re"\+?[0-9]+"
@@ -164,8 +176,10 @@ const OPTIONAL_MACHINE = let
     uint_B = re"[CSI]" * RE.rep1(re"," * unsigned)
     float_B = re"f" * RE.rep1(re"," * float)
     val_B = sint_B | uint_B | float_B
+    tag = re"[A-Za-z][A-Za-z0-9]"
+    tag.actions[:exit] = [:new_tag]
 
-    field = re"[A-Za-z][A-Za-z0-9]:" * RE.alt(
+    field = tag * re":" * RE.alt(
         re"A:[!-~]",
         re"i:" * signed,
         re"f:" * float,
@@ -173,24 +187,35 @@ const OPTIONAL_MACHINE = let
         re"H:[0-9A-F]+",
         re"B:" * val_B
     )
-
+    
     line = field * RE.rep(re"\t" * field)
     line.actions[:exit] = [:exit_machine]
     Automa.compile(line * RE.opt(re"[\r\n]"))
 end
 
+const OPTIONAL_ACTIONS = Dict(
+    :new_tag => quote
+        n_tags += 1
+        tag = Tag((data[p-2], data[p-1]), unsafe)
+        tags[n_tags] = tag
+    end,
+    :exit_machine => quote
+        optional_length = p - from + p_decremented
+        record.optional = record_index:record_index+optional_length-1
+        check_duplicates(tags, n_tags, linenum)
+        return p
+    end
+)
+
 Automa.Stream.generate_reader(
     :index_optional!,
     OPTIONAL_MACHINE;
-    arguments = (:(record::LazyRecord), :(from::Int), :(linenum::Int), :(record_index::Int)),
+    arguments = (:(record::LazyRecord), :(tags::Vector{Tag}), :(from::Int), :(linenum::Int), :(record_index::Int)),
     context = AUTOMA_CONTEXT,
-    actions = Dict(:exit_machine => quote
-        optional_length = p - from + p_decremented
-        record.optional = record_index:record_index+optional_length-1
-        return p
-    end),
+    actions = OPTIONAL_ACTIONS,
     initcode = quote
         byte = 0x00
+        n_tags = 0
         p_decremented = 0
         buffer.bufferpos = from
     end,
