@@ -23,6 +23,7 @@ const B_ARRAY_TYPES_DICT = Dict(
 
 const BArrayTypes = Union{values(B_ARRAY_TYPES_DICT)...}
 
+# The type of materialized optional data.
 const OptTypes = Union{Char, Int, Float32, String, Vector{<:BArrayTypes}}
 
 # Technically, adding more parameters to Base Julian types is not breaking, but if some genious
@@ -31,6 +32,7 @@ const OptTypes = Union{Char, Int, Float32, String, Vector{<:BArrayTypes}}
 const ViewType = SubArray{UInt8, 1, Vector{UInt8}, Tuple{UnitRange{Int64}}, true}
 @assert typeof(view([0x61], 1:1)) == ViewType
 
+# For efficiency, we don't allocate whole strings for two bytes
 struct Tag <: AbstractString
     x::NTuple{2, UInt8}
 
@@ -64,6 +66,9 @@ Base.isvalid(::Tag, i::Integer) = i == 1 || i == 2
 Base.length(::Tag) = 2
 Base.iterate(s::Tag, i::Int=1) = i > 2 ? nothing : (unsafe_char(s.x[i]), i+1)
 
+# This represents a single lazy optional data, e.g. "VN:Z:v1.29"
+# The type here would be UInt8('Z'), the data a view of "v1.29",
+# and the corresponding tag to this LazyOptional would be Tag("VN")
 struct LazyOptional
     type::UInt8
     data::ViewType
@@ -75,11 +80,36 @@ end
 
 LazyOptional(type::Char, data::Vector{UInt8}) = LazyOptional(UInt8(type), view(data, 1:length(data)))
 
+"""
+    OptionalFields <: AbstractDict{Tag, LazyOptional}
+
+Lazy iterator over the optional data of a GFA record.
+While it presents a `Dict` interface, accessing data is O(N), since it scans
+the underlying data left-to-right.
+
+See also: [`optionals`](@ref)
+"""
 struct OptionalFields <: AbstractDict{Tag, LazyOptional}
     x::LazyRecord
 end
+
+"""
+    optionals(::LazyRecord)::OptionalFields
+
+Create an `OptionalFields` lazy iterator of optional fields in the record.
+
+See also: [`OptionalFields`](@ref)
+"""
 optionals(x::LazyRecord) = OptionalFields(x)
 
+"""
+    materialize(::OptionalFields)::Dict
+
+Create a `Dict{Tag}` whose key/value pairs are the optional tags and their
+materialized values.
+This `Dict` is guaranteed to not contain any references to the underlying record data,
+so mutating the record data after materializing is safe.
+"""
 function materialize(x::OptionalFields)
     result = Dict{Tag, OptTypes}()
     for (k, v) in x
@@ -128,10 +158,35 @@ function Base.getindex(x::OptionalFields, k)
     y
 end
 
+"""
+    JSONString
+
+A wrapper around a `String`, which is supposed to be in JSON format.
+The data is not checked to actually be in JSON format.
+Access the underlying data with `String(::JSONString)`.
+"""
 struct JSONString
     x::String
 end
+String(x::JSONString) = x.x
 
+"""
+    materialize(::LazyOptional)
+
+Materialize the underlying data inside `LazyOptional`.
+The returned data is a Julia-native data structure of the same data,
+which is guaranteed to not depend on the data of the underlying record.
+
+# Extended help
+The following optional types map to the following Julia types:
+* `A => Char`
+* `i => Int`
+* `f => Float32`
+* `J => JSONString`
+* `Z => String`
+* `H => Vector{UInt8}`
+* `B => Vector{<:$(BArrayTypes)}` (appropriate concrete type selected)
+"""
 function materialize(tag::LazyOptional)::OptTypes
     type = tag.type
     data = tag.data
@@ -206,6 +261,8 @@ const OPTIONAL_ACTIONS = Dict(
         return p
     end
 )
+
+function index_optional! end
 
 Automa.Stream.generate_reader(
     :index_optional!,
